@@ -1,0 +1,28 @@
+# Override for arm64 hosts (Apple Silicon, Raspberry Pi, Graviton).
+#
+# The upstream whisper.cpp image is linux/amd64 only and aborts with SIGILL
+# under emulation as soon as audio is transcribed, so build whisper.cpp
+# natively here. On an amd64 host the plain docker-compose.yml is enough.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.arm64.yml up -d
+#
+# Sizing: the same reference machine applies (>= 6 cores, >= 16 GB RAM). ARM
+# CPUs use NEON instead of AVX2, so the AVX2 part of the requirement does not
+# apply here; the gateway reports it as "entfällt" in GET /v1/config.
+
+services:
+  whisper:
+    image: speechint-whisper:local
+    build:
+      context: .
+      dockerfile: Dockerfile.whisper
+    # Undo the linux/amd64 emulation default of the base file.
+    platform: !reset null
+    # Keep the production default model ("small"): it is what real deployments
+    # use, and its German accuracy is markedly better than "tiny".
+    environment:
+      WHISPER_MODEL: ${WHISPER_MODEL:-small}
+      # Same sizing basis as the base file: one thread per core of the
+      # reference machine.
+      WHISPER_THREADS: ${WHISPER_THREADS:-6}

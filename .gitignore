@@ -1,0 +1,24 @@
+# ── Runtime ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.log
+.pytest_cache/
+
+# ── Local model/audio scratch data ───────────────────────────────────────────
+models/
+audio/
+*.wav
+*.mp3
+*.ogg
+*.webm
+
+# ── Editor / OS ──────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+
+# ── Tool scratch ─────────────────────────────────────────────────────────────
+.playwright-mcp/
