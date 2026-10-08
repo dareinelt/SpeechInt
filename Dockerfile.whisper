@@ -1,0 +1,81 @@
+# Dockerfile.whisper – native build of whisper.cpp.
+#
+# Why this exists: the upstream image `ghcr.io/ggml-org/whisper.cpp` publishes
+# linux/amd64 only. On arm64 hosts (Apple Silicon) it therefore has to run under
+# emulation, where the inference kernels abort with SIGILL ("Illegal
+# instruction") as soon as audio is transcribed. Building the server natively
+# gives a working and much faster whisper service.
+#
+# The resulting image is a drop-in replacement for the upstream one: it exposes
+# the same `whisper-server` / `whisper-cli` binaries on PATH and keeps the model
+# download helper at /app/models/download-ggml-model.sh, so the command defined
+# in docker-compose.yml works unchanged.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.arm64.yml up -d
+# On an amd64 host the upstream image is fine and this build is not needed.
+
+# ── Stage 1: compile whisper.cpp ─────────────────────────────────────────────
+FROM debian:bookworm-slim AS build
+
+ARG WHISPER_CPP_REPO=https://github.com/ggml-org/whisper.cpp.git
+# Track the same moving branch the upstream `main` image tag uses, so the build
+# stays comparable to production. Override for a reproducible pin:
+#   --build-arg WHISPER_CPP_REF=v1.7.6
+ARG WHISPER_CPP_REF=master
+
+# Docker Desktop's Linux VM hides the host CPU model, so `-mcpu=native` resolves
+# to a baseline armv8-a without the FP16 vector instructions ggml needs, and the
+# build fails with "target specific option mismatch". Select the architecture
+# explicitly instead. armv8.2-a+fp16+dotprod covers every Apple Silicon chip;
+# override for other arm64 hosts (e.g. armv8-a on a Raspberry Pi 4).
+ARG WHISPER_ARM_ARCH=armv8.2-a+fp16+dotprod
+
+# GGML_NATIVE is off by default because the build VM cannot see the real CPU.
+# Set it to ON when building directly on the target amd64 host to get the full
+# instruction set (AVX2/AVX512) instead of the x86-64 baseline.
+ARG WHISPER_GGML_NATIVE=OFF
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential cmake git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+RUN git clone --depth 1 --branch "${WHISPER_CPP_REF}" "${WHISPER_CPP_REPO}" .
+
+# GGML_CPU_ARM_ARCH is ignored on x86_64, so one build serves both platforms.
+RUN cmake -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=OFF \
+      -DGGML_NATIVE="${WHISPER_GGML_NATIVE}" \
+      -DGGML_CPU_ARM_ARCH="${WHISPER_ARM_ARCH}" \
+      -DWHISPER_BUILD_TESTS=OFF \
+      -DWHISPER_BUILD_SERVER=ON \
+      -DWHISPER_BUILD_EXAMPLES=ON \
+ && cmake --build build --config Release -j"$(nproc)"
+
+# ── Stage 2: runtime ─────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+# libgomp1: OpenMP runtime used by the ggml CPU backend.
+# ffmpeg:    required by whisper-server's --convert (resamples the uploaded
+#            audio to the 16 kHz mono PCM whisper expects).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libgomp1 ffmpeg ca-certificates curl bash \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /src/build/bin/whisper-server /usr/local/bin/whisper-server
+COPY --from=build /src/build/bin/whisper-cli    /usr/local/bin/whisper-cli
+
+# Keep the upstream helper path so the compose command works unchanged.
+RUN mkdir -p /app/models
+COPY --from=build /src/models/download-ggml-model.sh /app/models/download-ggml-model.sh
+RUN chmod +x /app/models/download-ggml-model.sh
+
+WORKDIR /app
+
+EXPOSE 8080
+
+CMD ["whisper-server", "--host", "0.0.0.0", "--port", "8080"]

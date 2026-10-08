@@ -1,0 +1,192 @@
+# SpeechInt – whisper.cpp + llama.cpp behind one HTTP API.
+#
+# Three containers:
+#   gateway  FastAPI app that owns the public API (only published port)
+#   whisper  whisper.cpp server, speech recognition (internal only)
+#   llm      llama.cpp server with Qwen3.5-2B Q4, dictation clean-up (internal)
+#
+# The gateway is the only service that needs to be reachable from the LLMInt
+# host; whisper and llm stay on the internal network.
+#
+# Start:   docker compose up -d
+# Logs:    docker compose logs -f gateway
+# arm64:   docker compose -f docker-compose.yml -f docker-compose.arm64.yml up -d
+#
+# All values can be set in .env (see .env.example).
+#
+# ── Sizing ────────────────────────────────────────────────────────────────────
+# This stack is dimensioned for the smallest supported endpoint:
+#
+#     >= 6 CPU cores with AVX2 (x86-64) and >= 16 GB RAM
+#
+# On that machine both model servers run with six threads, which is what the
+# thread defaults below assume. The whole stack stays well inside the budget:
+#
+#     gateway  ~0.3 GB     whisper (small)  ~1.2 GB     llm (2B Q4)  ~3.0 GB
+#
+# The memory ceilings below leave room for that plus the first-start download
+# buffers. An endpoint below the reference still runs – it is only slower – and
+# the gateway logs the deviation at startup (see GET /v1/config, field "host").
+
+services:
+  # ── API gateway ─────────────────────────────────────────────────────────────
+  # Wraps both model servers behind /v1/*. Stateless: the dictation command
+  # table, prompt and model id are sent by the client with every request, so an
+  # administrator keeps configuring everything in LLMInt.
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    image: speechint-gateway:${SPEECHINT_IMAGE_TAG:-local}
+    restart: unless-stopped
+    # The gateway only orchestrates HTTP calls, so it needs little memory.
+    mem_limit: ${SPEECHINT_MEM_LIMIT:-512m}
+    ports:
+      # The published port is what LLMInt talks to. Change the left side only.
+      - "${SPEECHINT_PORT:-8080}:8080"
+    environment:
+      # Shared secret clients must send as X-Auth-Token / Authorization: Bearer.
+      # Empty disables authentication – only acceptable in a trusted network.
+      SPEECHINT_TOKEN: ${SPEECHINT_TOKEN:-}
+      SPEECHINT_MAX_AUDIO_MB: ${SPEECHINT_MAX_AUDIO_MB:-25}
+      SPEECHINT_MAX_CONTEXT_CHARS: ${SPEECHINT_MAX_CONTEXT_CHARS:-400}
+      SPEECHINT_DEFAULT_LANGUAGE: ${SPEECHINT_DEFAULT_LANGUAGE:-de}
+      SPEECHINT_TEMPERATURE: ${SPEECHINT_TEMPERATURE:-0.1}
+      SPEECHINT_LOG_LEVEL: ${SPEECHINT_LOG_LEVEL:-INFO}
+      WHISPER_URL: http://whisper:8080
+      WHISPER_TOKEN: ${WHISPER_TOKEN:-}
+      WHISPER_TIMEOUT: ${WHISPER_TIMEOUT:-120}
+      WHISPER_MODEL: ${WHISPER_MODEL:-small}
+      WHISPER_LANGUAGE: ${WHISPER_LANGUAGE:-de}
+      LLM_URL: http://llm:8080
+      LLM_TOKEN: ${LLM_TOKEN:-}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-60}
+      LLM_MODEL: ${LLM_MODEL_ALIAS:-Qwen3.5-2B Q4}
+      TZ: ${TZ:-Europe/Berlin}
+    depends_on:
+      whisper:
+        condition: service_started
+      llm:
+        condition: service_started
+
+  # ── Speech recognition (whisper.cpp HTTP server) ────────────────────────────
+  # Serves the whisper.cpp REST API (/inference, /health) on port 8080. The GGML
+  # model is downloaded once into a named volume, so restarts do not
+  # re-download it. Internal only: no host port is published.
+  whisper:
+    image: ghcr.io/ggml-org/whisper.cpp:${WHISPER_IMAGE_TAG:-main}
+    # whisper.cpp only publishes a linux/amd64 image (the `main` tag is the
+    # only moving tag). Declaring the platform keeps the service startable on
+    # arm64 hosts such as Apple Silicon, where Docker emulates amd64 – slower
+    # than native, but far better than the hard "no matching manifest" failure.
+    # docker-compose.arm64.yml resets this and builds natively instead.
+    platform: ${WHISPER_PLATFORM:-linux/amd64}
+    restart: unless-stopped
+    # "small" needs ~1 GB once loaded; the ceiling covers the download buffer too.
+    mem_limit: ${WHISPER_MEM_LIMIT:-2g}
+    mem_reservation: ${WHISPER_MEM_RESERVATION:-1g}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        # NOTE: variables are written as $${VAR} so the container shell resolves
+        # them at runtime. With a single dollar Compose would interpolate them
+        # from the host environment instead, silently ignoring WHISPER_MODEL.
+        MODEL="$${WHISPER_MODEL:-small}"
+        FILE="/models/ggml-$${MODEL}.bin"
+        if [ ! -s "$${FILE}" ]; then
+          echo "[whisper] downloading model '$${MODEL}' ..."
+          bash /app/models/download-ggml-model.sh "$${MODEL}" /models
+        fi
+        echo "[whisper] starting whisper-server with '$${FILE}'"
+        exec whisper-server \
+          --host 0.0.0.0 \
+          --port 8080 \
+          --model "$${FILE}" \
+          --language "$${WHISPER_LANGUAGE:-de}" \
+          --threads "$${WHISPER_THREADS:-6}" \
+          $${WHISPER_API_KEY:+--api-key "$${WHISPER_API_KEY}"} \
+          --convert
+    environment:
+      WHISPER_MODEL: ${WHISPER_MODEL:-small}
+      WHISPER_LANGUAGE: ${WHISPER_LANGUAGE:-de}
+      # One thread per core of the reference machine. whisper.cpp scales up to
+      # about eight threads, so a bigger host can raise this.
+      WHISPER_THREADS: ${WHISPER_THREADS:-6}
+      WHISPER_API_KEY: ${WHISPER_TOKEN:-}
+      TZ: ${TZ:-Europe/Berlin}
+    volumes:
+      # Persists ggml-*.bin so the model is fetched only on the first start.
+      - whisper_models:/models
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # Downloading the "small" model takes a while on first boot.
+      start_period: 300s
+
+  # ── Dictation model (Qwen3.5-2B Q4 via llama.cpp) ───────────────────────────
+  # Dedicated llama.cpp server that turns the raw transcript into clean,
+  # command-processed text. Exposes the OpenAI-compatible API
+  # (/v1/chat/completions, /health) on port 8080. Internal only.
+  #
+  # The GGUF is pulled from Hugging Face on first start and cached in the
+  # llm_cache volume (LLAMA_CACHE). Swap LLM_IMAGE_TAG to `server-cuda`,
+  # `server-vulkan` or `server-rocm` for GPU acceleration.
+  llm:
+    image: ghcr.io/ggml-org/llama.cpp:${LLM_IMAGE_TAG:-server}
+    restart: unless-stopped
+    # Weights (~1.5 GB) plus KV cache and compute buffers; the ceiling leaves
+    # headroom for a larger quantisation or model.
+    mem_limit: ${LLM_MEM_LIMIT:-5g}
+    mem_reservation: ${LLM_MEM_RESERVATION:-3g}
+    command:
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8080"
+      # --hf-repo downloads (and caches) the quantised model from Hugging Face.
+      - --hf-repo
+      - ${LLM_GGUF_REPO:-unsloth/Qwen3.5-2B-GGUF}
+      - --hf-file
+      - ${LLM_GGUF_FILE:-Qwen3.5-2B-Q4_K_M.gguf}
+      # The alias is the model id the dictation pipeline sends, so it must match
+      # LLM_MODEL on the gateway (default "Qwen3.5-2B Q4").
+      - --alias
+      - ${LLM_MODEL_ALIAS:-Qwen3.5-2B Q4}
+      # All slots share this context (unified KV cache), so raise it when
+      # serving more than one dictation at a time.
+      - --ctx-size
+      - ${LLM_CTX_SIZE:-4096}
+      - --parallel
+      - ${LLM_PARALLEL:-1}
+      - --threads
+      - ${LLM_THREADS:-6}
+      # A 2B model saturates the memory bandwidth of six cores; more threads
+      # only add contention.
+      - --threads-batch
+      - ${LLM_THREADS_BATCH:-6}
+      # Jinja templates are required for chat_template_kwargs.enable_thinking,
+      # which the gateway uses to keep the thinking block off.
+      - --jinja
+      - --no-webui
+    environment:
+      LLAMA_ARG_HOST: "0.0.0.0"
+      # Keeps the downloaded GGUF inside the mounted volume.
+      LLAMA_CACHE: /models
+      LLAMA_API_KEY: ${LLM_TOKEN:-}
+      TZ: ${TZ:-Europe/Berlin}
+    volumes:
+      - llm_cache:/models
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # The first start downloads ~1.1 GB of model weights.
+      start_period: 600s
+
+volumes:
+  whisper_models:
+  llm_cache:
