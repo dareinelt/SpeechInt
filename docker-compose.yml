@@ -53,6 +53,12 @@ services:
       SPEECHINT_DEFAULT_LANGUAGE: ${SPEECHINT_DEFAULT_LANGUAGE:-de}
       SPEECHINT_TEMPERATURE: ${SPEECHINT_TEMPERATURE:-0.1}
       SPEECHINT_LOG_LEVEL: ${SPEECHINT_LOG_LEVEL:-INFO}
+      # Loading contract: how long a probe is cached, how many seconds a 503
+      # tells the client to wait, and how long a never-reachable model server
+      # counts as "still starting" instead of "broken".
+      SPEECHINT_HEALTH_CACHE_SECONDS: ${SPEECHINT_HEALTH_CACHE_SECONDS:-5}
+      SPEECHINT_LOADING_RETRY_AFTER: ${SPEECHINT_LOADING_RETRY_AFTER:-15}
+      SPEECHINT_STARTING_GRACE_SECONDS: ${SPEECHINT_STARTING_GRACE_SECONDS:-900}
       WHISPER_URL: http://whisper:8080
       WHISPER_TOKEN: ${WHISPER_TOKEN:-}
       WHISPER_TIMEOUT: ${WHISPER_TIMEOUT:-120}

@@ -19,3 +19,6 @@ audio/
 .DS_Store
 .idea/
 .vscode/
+
+# ── Tool scratch ─────────────────────────────────────────────────────────────
+.playwright-mcp/

@@ -122,6 +122,10 @@ internen Netz. Alle `/v1/*`-Routen außer `/v1/ready` verlangen den Token als
 | `POST` | `/v1/dictate/process` | Transkriptfragment → fertiger Text |
 | `POST` | `/v1/dictate` | Audiodatei → fertiger Text (in einem Aufruf) |
 
+Die interaktive Beschreibung liegt unter `http://<host>:<port>/docs`:
+
+![Swagger UI des Gateways](docs/screenshots/api-docs.png)
+
 Beispiele:
 
 ```bash
